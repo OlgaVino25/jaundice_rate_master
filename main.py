@@ -1,11 +1,13 @@
-import aiohttp
 import asyncio
-import pymorphy2
-import os
 import glob
+import os
+
+import aiohttp
+import pymorphy2
 
 from adapters.inosmi_ru import sanitize
-from text_tools import split_by_words, calculate_jaundice_rate
+from text_tools import calculate_jaundice_rate, split_by_words
+
 
 async def fetch(session, url):
     async with session.get(url) as response:
@@ -18,7 +20,7 @@ def load_charged_words(directory="charged_dict"):
 
     charged_words = []
 
-    pattern =os.path.join(directory, "*.txt")
+    pattern = os.path.join(directory, "*.txt")
 
     for filepath in glob.glob(pattern):
         with open(filepath, "r", encoding="utf-8") as f:
@@ -39,7 +41,7 @@ async def main():
         article_words = split_by_words(morph, clean_text)
 
         charged_words = load_charged_words()
-        
+
         rate = calculate_jaundice_rate(article_words, charged_words)
 
         print(f"Рейтинг: {rate:.2f}")
