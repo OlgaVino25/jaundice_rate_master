@@ -4,9 +4,34 @@ import os
 
 import aiohttp
 import pymorphy2
+from anyio import create_task_group
 
 from adapters.inosmi_ru import sanitize
 from text_tools import calculate_jaundice_rate, split_by_words
+
+TEST_ARTICLES = [
+    "https://inosmi.ru/20260525/tramp-278594105.html",
+    "https://inosmi.ru/20260525/bpla-278594994.html",
+    "https://inosmi.ru/20260525/madyar-278593948.html",
+    "https://inosmi.ru/20260523/svyaz-278575751.html",
+    "https://inosmi.ru/20260525/rossiya-278593248.html",
+]
+
+
+def load_charged_words(directory="charged_dict"):
+    """Загружает все слова из .txt файлов в папке directory."""
+
+    charged_words = set()
+
+    pattern = os.path.join(directory, "*.txt")
+
+    for filepath in glob.glob(pattern):
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                word = line.strip().lower()
+                if word:
+                    charged_words.add(word)
+    return list(charged_words)
 
 
 async def fetch(session, url):
@@ -15,37 +40,42 @@ async def fetch(session, url):
         return await response.text()
 
 
-def load_charged_words(directory="charged_dict"):
-    """Загружает все слова из .txt файлов в папке directory."""
+async def process_article(session, url, charged_words, morph):
+    """Возвращает кортеж (url, рейтинг, количество слов)."""
 
-    charged_words = []
+    try:
+        html = await fetch(session, url)
+        clean_text = sanitize(html, plaintext=True)
+        article_words = split_by_words(morph, clean_text)
+        rate = calculate_jaundice_rate(article_words, charged_words)
+        return url, rate, len(article_words)
+    except Exception as e:
+        print(f"Ошибка при обработке {url}: {e}")
+        return url, 0.0, 0
 
-    pattern = os.path.join(directory, "*.txt")
 
-    for filepath in glob.glob(pattern):
-        with open(filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                word = line.strip()
-                if word:
-                    charged_words.append(word.lower())
-    return list(set(charged_words))
+async def set_result(idx, url, session, charged_words, morph, results):
+    res = await process_article(session, url, charged_words, morph)
+    results[idx] = res
 
 
 async def main():
-    url = "https://inosmi.ru/20260514/vizit-278427943.html"
+    charged_words = load_charged_words()
+    morph = pymorphy2.MorphAnalyzer()
     async with aiohttp.ClientSession() as session:
-        html = await fetch(session, url)
-        clean_text = sanitize(html, plaintext=True)
+        results = [None] * len(TEST_ARTICLES)
+        async with create_task_group() as tg:
+            for idx, url in enumerate(TEST_ARTICLES):
+                tg.start_soon(
+                    set_result, idx, url, session, charged_words, morph, results
+                )
 
-        morph = pymorphy2.MorphAnalyzer()
-        article_words = split_by_words(morph, clean_text)
-
-        charged_words = load_charged_words()
-
-        rate = calculate_jaundice_rate(article_words, charged_words)
-
-        print(f"Рейтинг: {rate:.2f}")
-        print(f"Слов в статье: {len(article_words)}")
+        print("\nРезультаты анализа:\n")
+        for url, rate, word_count in results:
+            print(f"URL: {url}")
+            print(f"Рейтинг: {rate:.2f}")
+            print(f"Слов в статье: {word_count}")
+            print("-" * 50)
 
 
 asyncio.run(main())
