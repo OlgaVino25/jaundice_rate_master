@@ -8,10 +8,13 @@ import aiohttp
 import pymorphy2
 from anyio import create_task_group
 
+from adapters.exceptions import ArticleNotFound
 from adapters.inosmi_ru import sanitize
 from text_tools import calculate_jaundice_rate, split_by_words
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 TEST_ARTICLES = [
@@ -26,6 +29,7 @@ TEST_ARTICLES = [
 class ProcessingStatus(Enum):
     OK = "OK"
     FETCH_ERROR = "FETCH_ERROR"
+    PARSING_ERROR = "PARSING_ERROR"
 
 
 def load_charged_words(directory="charged_dict"):
@@ -60,8 +64,11 @@ async def process_article(session, url, charged_words, morph):
         rate = calculate_jaundice_rate(article_words, charged_words)
         return url, ProcessingStatus.OK, rate, len(article_words)
     except aiohttp.ClientError as e:
-        logger.error(f"Ошибка при обработке {url}: {e}")
+        logger.error(f"Ошибка HTTP при обработке {url}: {e}")
         return url, ProcessingStatus.FETCH_ERROR, None, None
+    except ArticleNotFound as e:
+        logger.error(f"Статья не найдена на {url}: {e}")
+        return url, ProcessingStatus.PARSING_ERROR, None, None
     except Exception as e:
         logger.exception(f"Неожиданная ошибка при обработке {url}: {e}")
         return url, ProcessingStatus.FETCH_ERROR, None, None
@@ -80,7 +87,9 @@ async def main():
         results = [None] * len(TEST_ARTICLES)
         async with create_task_group() as tg:
             for idx, url in enumerate(TEST_ARTICLES):
-                tg.start_soon(set_result, idx, url, session, charged_words, morph, results)
+                tg.start_soon(
+                    set_result, idx, url, session, charged_words, morph, results
+                )
 
         print("\nРезультаты анализа:\n")
         for url, status, rate, word_count in results:
