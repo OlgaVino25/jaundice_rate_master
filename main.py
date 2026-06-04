@@ -2,6 +2,7 @@ import asyncio
 import glob
 import logging
 import os
+import time
 from enum import Enum
 
 import aiohttp
@@ -25,6 +26,7 @@ TEST_ARTICLES = [
 ]
 
 REQUEST_TIMEOUT = 5
+ANALYSIS_TIMEOUT = 3
 
 
 class ProcessingStatus(Enum):
@@ -56,28 +58,47 @@ async def fetch(session, url):
         return await response.text()
 
 
-async def process_article(session, url, charged_words, morph):
-    """Возвращает кортеж (url, рейтинг, количество слов)."""
+def _analyze_text(html, charged_words, morph):
+    """Синхронная обработка текста (запускается в отдельном потоке)."""
 
+    clean_text = sanitize(html, plaintext=True)
+    article_words = split_by_words(morph, clean_text)
+    rate = calculate_jaundice_rate(article_words, charged_words)
+    return clean_text, article_words, rate, len(article_words)
+
+
+async def process_article(session, url, charged_words, morph):
+    """Возвращает кортеж (url, статус, рейтинг, количество слов, время_сек)."""
+
+    start_time = time.monotonic()
     try:
         async with async_timeout.timeout(REQUEST_TIMEOUT):
             html = await fetch(session, url)
-        clean_text = sanitize(html, plaintext=True)
-        article_words = split_by_words(morph, clean_text)
-        rate = calculate_jaundice_rate(article_words, charged_words)
-        return url, ProcessingStatus.OK, rate, len(article_words)
-    except async_timeout.TimeoutError:
+
+        try:
+            _, _, rate, word_count = await asyncio.wait_for(
+                asyncio.to_thread(_analyze_text, html, charged_words, morph), timeout=ANALYSIS_TIMEOUT
+            )
+        except TimeoutError:
+            logger.error(f"Таймаут анализа статьи {url}")
+            return url, ProcessingStatus.TIMEOUT, None, None, None
+
+        elapsed_time = time.monotonic() - start_time
+        logger.info(f"Анализ {url} завершён за {elapsed_time:.2f} сек.")
+        return url, ProcessingStatus.OK, rate, word_count, elapsed_time
+
+    except TimeoutError:
         logger.error(f"Таймаут при скачивании {url}")
-        return url, ProcessingStatus.TIMEOUT, None, None
+        return url, ProcessingStatus.TIMEOUT, None, None, None
     except aiohttp.ClientError as e:
         logger.error(f"Ошибка HTTP при обработке {url}: {e}")
-        return url, ProcessingStatus.FETCH_ERROR, None, None
+        return url, ProcessingStatus.FETCH_ERROR, None, None, None
     except ArticleNotFound as e:
         logger.error(f"Статья не найдена на {url}: {e}")
-        return url, ProcessingStatus.PARSING_ERROR, None, None
+        return url, ProcessingStatus.PARSING_ERROR, None, None, None
     except Exception as e:
         logger.exception(f"Неожиданная ошибка при обработке {url}: {e}")
-        return url, ProcessingStatus.FETCH_ERROR, None, None
+        return url, ProcessingStatus.FETCH_ERROR, None, None, None
 
 
 async def set_result(idx, url, session, charged_words, morph, results):
@@ -96,12 +117,16 @@ async def main():
                 tg.start_soon(set_result, idx, url, session, charged_words, morph, results)
 
         print("\nРезультаты анализа:\n")
-        for url, status, rate, word_count in results:
+        for item in results:
+            if item is None:
+                continue
+            url, status, rate, word_count, elapsed_time = item
             print(f"URL: {url}")
             print(f"Статус: {status.value}")
             if status == ProcessingStatus.OK:
                 print(f"Рейтинг: {rate:.2f}")
                 print(f"Слов в статье: {word_count}")
+                print(f"Время анализа: {elapsed_time:.2f} сек.")
             else:
                 print("Рейтинг: None")
                 print("Слов в статье: None")
