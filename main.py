@@ -5,6 +5,7 @@ import os
 from enum import Enum
 
 import aiohttp
+import async_timeout
 import pymorphy2
 from anyio import create_task_group
 
@@ -12,9 +13,7 @@ from adapters.exceptions import ArticleNotFound
 from adapters.inosmi_ru import sanitize
 from text_tools import calculate_jaundice_rate, split_by_words
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 TEST_ARTICLES = [
@@ -25,11 +24,14 @@ TEST_ARTICLES = [
     "https://inosmi.ru/20260525/rossiya-278593248.html",
 ]
 
+REQUEST_TIMEOUT = 5
+
 
 class ProcessingStatus(Enum):
     OK = "OK"
     FETCH_ERROR = "FETCH_ERROR"
     PARSING_ERROR = "PARSING_ERROR"
+    TIMEOUT = "TIMEOUT"
 
 
 def load_charged_words(directory="charged_dict"):
@@ -58,11 +60,15 @@ async def process_article(session, url, charged_words, morph):
     """Возвращает кортеж (url, рейтинг, количество слов)."""
 
     try:
-        html = await fetch(session, url)
+        async with async_timeout.timeout(REQUEST_TIMEOUT):
+            html = await fetch(session, url)
         clean_text = sanitize(html, plaintext=True)
         article_words = split_by_words(morph, clean_text)
         rate = calculate_jaundice_rate(article_words, charged_words)
         return url, ProcessingStatus.OK, rate, len(article_words)
+    except async_timeout.TimeoutError:
+        logger.error(f"Таймаут при скачивании {url}")
+        return url, ProcessingStatus.TIMEOUT, None, None
     except aiohttp.ClientError as e:
         logger.error(f"Ошибка HTTP при обработке {url}: {e}")
         return url, ProcessingStatus.FETCH_ERROR, None, None
@@ -87,9 +93,7 @@ async def main():
         results = [None] * len(TEST_ARTICLES)
         async with create_task_group() as tg:
             for idx, url in enumerate(TEST_ARTICLES):
-                tg.start_soon(
-                    set_result, idx, url, session, charged_words, morph, results
-                )
+                tg.start_soon(set_result, idx, url, session, charged_words, morph, results)
 
         print("\nРезультаты анализа:\n")
         for url, status, rate, word_count in results:
