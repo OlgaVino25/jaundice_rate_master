@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import glob
 import logging
@@ -6,7 +7,6 @@ import time
 from enum import Enum
 
 import aiohttp
-import async_timeout
 import pymorphy2
 from anyio import create_task_group
 
@@ -17,23 +17,43 @@ from text_tools import calculate_jaundice_rate, split_by_words
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-TEST_ARTICLES = [
-    "https://inosmi.ru/20260525/tramp-278594105.html",
-    "https://inosmi.ru/20260525/bpla-278594994.html",
-    "https://inosmi.ru/20260525/madyar-278593948.html",
-    "https://inosmi.ru/20260523/svyaz-278575751.html",
-    "https://inosmi.ru/20260525/rossiya-278593248.html",
-]
-
-REQUEST_TIMEOUT = 5
-ANALYSIS_TIMEOUT = 3
-
 
 class ProcessingStatus(Enum):
     OK = "OK"
     FETCH_ERROR = "FETCH_ERROR"
     PARSING_ERROR = "PARSING_ERROR"
     TIMEOUT = "TIMEOUT"
+
+
+def parse_args() -> argparse.Namespace:
+    """Разбирает аргументы командной строки."""
+    parser = argparse.ArgumentParser(description="Анализ статей Inosmi.ru на желтушность")
+    parser.add_argument("urls", nargs="+", help="Список URL статей для анализа")
+    parser.add_argument(
+        "--fetch-timeout",
+        type=int,
+        default=5,
+        help="Таймаут скачивания страницы (сек)",
+    )
+    parser.add_argument(
+        "--parse-timeout",
+        type=int,
+        default=3,
+        help="Таймаут анализа текста (сек)",
+    )
+    parser.add_argument(
+        "--retry-attempts",
+        type=int,
+        default=3,
+        help="Количество повторных попыток при сетевых ошибках",
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=1.0,
+        help="Начальная задержка между попытками (сек)",
+    )
+    return parser.parse_args()
 
 
 def load_charged_words(directory="charged_dict"):
@@ -52,10 +72,37 @@ def load_charged_words(directory="charged_dict"):
     return list(charged_words)
 
 
-async def fetch(session, url):
-    async with session.get(url) as response:
-        response.raise_for_status()
-        return await response.text()
+async def fetch_with_retry(session, url, timeout, retries, delay):
+    """Скачивает страницу с повторными попытками.
+
+    Args:
+        session: Сессия aiohttp.
+        url: URL страницы.
+        timeout: Таймаут на один запрос.
+        retries: Максимум попыток.
+        delay: Начальная задержка (увеличивается с каждой попыткой).
+
+    Returns:
+        Текст HTML.
+
+    Raises:
+        aiohttp.ClientError: Если после всех попыток запрос не удался.
+        asyncio.TimeoutError: Если время ожидания истекло.
+    """
+
+    for attempt in range(retries):
+        try:
+            async with asyncio.timeout(timeout):
+                async with session.get(url) as response:
+                    response.raise_for_status()
+                    return await response.text()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            if attempt == retries - 1:
+                raise
+            wait = delay * (attempt + 1)
+            logger.warning(f"Повтор {attempt + 1} для {url} через {wait:.1f} сек: {e}")
+            await asyncio.sleep(wait)
+    raise RuntimeError("Unreachable")
 
 
 def _analyze_text(html, charged_words, morph):
@@ -67,17 +114,16 @@ def _analyze_text(html, charged_words, morph):
     return clean_text, article_words, rate, len(article_words)
 
 
-async def process_article(session, url, charged_words, morph):
+async def process_article(session, url, charged_words, morph, fetch_timeout, parse_timeout, retries, retry_delay):
     """Возвращает кортеж (url, статус, рейтинг, количество слов, время_сек)."""
 
     start_time = time.monotonic()
     try:
-        async with async_timeout.timeout(REQUEST_TIMEOUT):
-            html = await fetch(session, url)
+        html = await fetch_with_retry(session, url, fetch_timeout, retries, retry_delay)
 
         try:
             _, _, rate, word_count = await asyncio.wait_for(
-                asyncio.to_thread(_analyze_text, html, charged_words, morph), timeout=ANALYSIS_TIMEOUT
+                asyncio.to_thread(_analyze_text, html, charged_words, morph), timeout=parse_timeout
             )
         except TimeoutError:
             logger.error(f"Таймаут анализа статьи {url}")
@@ -96,45 +142,60 @@ async def process_article(session, url, charged_words, morph):
     except ArticleNotFound as e:
         logger.error(f"Статья не найдена на {url}: {e}")
         return url, ProcessingStatus.PARSING_ERROR, None, None, None
-    except Exception as e:
-        logger.exception(f"Неожиданная ошибка при обработке {url}: {e}")
-        return url, ProcessingStatus.FETCH_ERROR, None, None, None
 
 
-async def set_result(idx, url, session, charged_words, morph, results):
-    res = await process_article(session, url, charged_words, morph)
-    results[idx] = res
-
-
-async def main():
+async def main(urls, fetch_timeout, parse_timeout, retry_attempts, retry_delay):
     charged_words = load_charged_words()
     morph = pymorphy2.MorphAnalyzer()
 
     async with aiohttp.ClientSession() as session:
-        results = [None] * len(TEST_ARTICLES)
-        async with create_task_group() as tg:
-            for idx, url in enumerate(TEST_ARTICLES):
-                tg.start_soon(set_result, idx, url, session, charged_words, morph, results)
+        results = [None] * len(urls)
 
-        print("\nРезультаты анализа:\n")
+        async with create_task_group() as tg:
+            for idx, url in enumerate(urls):
+
+                async def worker(i=idx, u=url):
+                    results[i] = await process_article(
+                        session,
+                        u,
+                        charged_words,
+                        morph,
+                        fetch_timeout,
+                        parse_timeout,
+                        retry_attempts,
+                        retry_delay,
+                    )
+
+                tg.start_soon(worker)
+
+        logger.info("\nРезультаты анализа:\n")
         for item in results:
             if item is None:
                 continue
             url, status, rate, word_count, elapsed_time = item
-            print(f"URL: {url}")
-            print(f"Статус: {status.value}")
+            logger.info(f"URL: {url}")
+            logger.info(f"Статус: {status.value}")
             if status == ProcessingStatus.OK:
-                print(f"Рейтинг: {rate:.2f}")
-                print(f"Слов в статье: {word_count}")
-                print(f"Время анализа: {elapsed_time:.2f} сек.")
+                logger.info(f"Рейтинг: {rate:.2f}")
+                logger.info(f"Слов в статье: {word_count}")
+                logger.info(f"Время анализа: {elapsed_time:.2f} сек.")
             else:
-                print("Рейтинг: None")
-                print("Слов в статье: None")
-            print("-" * 50)
+                logger.info("Рейтинг: None")
+                logger.info("Слов в статье: None")
+            logger.info("-" * 50)
 
 
 if __name__ == "__main__":
+    args = parse_args()
     try:
-        asyncio.run(main())
+        asyncio.run(
+            main(
+                urls=args.urls,
+                fetch_timeout=args.fetch_timeout,
+                parse_timeout=args.parse_timeout,
+                retry_attempts=args.retry_attempts,
+                retry_delay=args.retry_delay,
+            )
+        )
     except KeyboardInterrupt:
-        print("\nВыход")
+        logger.info("\nВыход по прерыванию")

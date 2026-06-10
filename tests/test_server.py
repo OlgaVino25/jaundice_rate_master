@@ -1,3 +1,5 @@
+"""Тесты для server.py."""
+
 from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp

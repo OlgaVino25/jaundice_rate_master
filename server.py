@@ -7,8 +7,6 @@ from enum import Enum
 from functools import partial
 
 import aiohttp
-import anyio
-import async_timeout
 import pymorphy2
 from aiohttp import web
 
@@ -22,6 +20,8 @@ logger = logging.getLogger(__name__)
 REQUEST_TIMEOUT = 5
 ANALYSIS_TIMEOUT = 3
 MAX_URLS = 10
+RETRY_ATTEMPTS = 3
+RETRY_DELAY = 1.0
 
 
 class ProcessingStatus(Enum):
@@ -32,6 +32,8 @@ class ProcessingStatus(Enum):
 
 
 def load_charged_words(directory="charged_dict"):
+    """Загружает список «заряженных» слов из текстовых файлов в папке."""
+
     charged_words = set()
     pattern = os.path.join(directory, "*.txt")
     for filepath in glob.glob(pattern):
@@ -44,11 +46,32 @@ def load_charged_words(directory="charged_dict"):
 
 
 async def fetch(session, url):
-    """Скачивает HTML-страницу по URL и возвращает текст."""
+    """Скачивает HTML-страницу с повторными попытками при сбоях.
 
-    async with session.get(url) as response:
-        response.raise_for_status()
-        return await response.text()
+    Args:
+        session: Сессия aiohttp.
+        url: URL страницы.
+
+    Returns:
+        Текст HTML.
+
+    Raises:
+        aiohttp.ClientError: Если после всех попыток запрос не удался.
+        asyncio.TimeoutError: Если истекло время ожидания ответа.
+    """
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            async with asyncio.timeout(REQUEST_TIMEOUT):
+                async with session.get(url) as response:
+                    response.raise_for_status()
+                    return await response.text()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            if attempt == RETRY_ATTEMPTS - 1:
+                raise
+            delay = RETRY_DELAY * (attempt + 1)
+            logger.warning("Повторная попытка %d для %s через %.1f сек: %s", attempt + 1, url, delay, e)
+            await asyncio.sleep(delay)
+    raise RuntimeError("Недостижимая строка")
 
 
 def _analyze_text(html, charged_words, morph):
@@ -61,12 +84,11 @@ def _analyze_text(html, charged_words, morph):
 
 
 async def process_article(session, url, charged_words, morph):
-    """Возвращает словарь с результатами анализа."""
+    """Обрабатывает одну статью: скачивает, анализирует, возвращает результат."""
 
     start_time = time.monotonic()
     try:
-        async with async_timeout.timeout(REQUEST_TIMEOUT):
-            html = await fetch(session, url)
+        html = await fetch(session, url)
 
         try:
             _, _, rate, word_count = await asyncio.wait_for(
@@ -112,18 +134,11 @@ async def process_article(session, url, charged_words, morph):
             "words_count": None,
             "time": None,
         }
-    except Exception as e:
-        logger.exception(f"Неожиданная ошибка при обработке {url}: {e}")
-        return {
-            "url": url,
-            "status": ProcessingStatus.FETCH_ERROR.value,
-            "score": None,
-            "words_count": None,
-            "time": None,
-        }
 
 
 async def handle(request, charged_words, morph):
+    """Обработчик HTTP-запроса."""
+
     urls_param = request.query.get("urls", "")
     if not urls_param:
         urls_list = []
@@ -135,7 +150,7 @@ async def handle(request, charged_words, morph):
 
     async with aiohttp.ClientSession() as session:
         tasks = [process_article(session, url, charged_words, morph) for url in urls_list]
-        results = await anyio.create_task_group(*tasks)
+        results = await asyncio.gather(*tasks)
 
     return web.json_response(results)
 
