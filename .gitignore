@@ -1,0 +1,63 @@
+# Виртуальное окружение
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Файлы IDE
+.vscode/
+.idea/
+*.sublime-*
+*.swp
+*.swo
+
+# Файлы Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+
+# Тесты и покрытие
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Логи
+*.log
+
+# Базы данных
+*.sqlite3
+*.db
+*.sqlite
+
+# Медиа (если появятся)
+media/
+staticfiles/
+
+# Файлы окружения и конфигурации
+.env
+.env.local
+.env.*.local
+
+# Файлы операционной системы
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Дистрибутивы и сборка
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Прочее
+*.bak
+*.tmp
+*~

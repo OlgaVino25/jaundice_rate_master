@@ -4,11 +4,13 @@ import logging
 import os
 import time
 from enum import Enum
+from functools import partial
 
 import aiohttp
+import anyio
 import async_timeout
 import pymorphy2
-from anyio import create_task_group
+from aiohttp import web
 
 from adapters.exceptions import ArticleNotFound
 from adapters.inosmi_ru import sanitize
@@ -17,16 +19,9 @@ from text_tools import calculate_jaundice_rate, split_by_words
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-TEST_ARTICLES = [
-    "https://inosmi.ru/20260525/tramp-278594105.html",
-    "https://inosmi.ru/20260525/bpla-278594994.html",
-    "https://inosmi.ru/20260525/madyar-278593948.html",
-    "https://inosmi.ru/20260523/svyaz-278575751.html",
-    "https://inosmi.ru/20260525/rossiya-278593248.html",
-]
-
 REQUEST_TIMEOUT = 5
 ANALYSIS_TIMEOUT = 3
+MAX_URLS = 10
 
 
 class ProcessingStatus(Enum):
@@ -37,12 +32,8 @@ class ProcessingStatus(Enum):
 
 
 def load_charged_words(directory="charged_dict"):
-    """Загружает все слова из .txt файлов в папке directory."""
-
     charged_words = set()
-
     pattern = os.path.join(directory, "*.txt")
-
     for filepath in glob.glob(pattern):
         with open(filepath, "r", encoding="utf-8") as f:
             for line in f:
@@ -53,6 +44,8 @@ def load_charged_words(directory="charged_dict"):
 
 
 async def fetch(session, url):
+    """Скачивает HTML-страницу по URL и возвращает текст."""
+
     async with session.get(url) as response:
         response.raise_for_status()
         return await response.text()
@@ -68,7 +61,7 @@ def _analyze_text(html, charged_words, morph):
 
 
 async def process_article(session, url, charged_words, morph):
-    """Возвращает кортеж (url, статус, рейтинг, количество слов, время_сек)."""
+    """Возвращает словарь с результатами анализа."""
 
     start_time = time.monotonic()
     try:
@@ -81,60 +74,83 @@ async def process_article(session, url, charged_words, morph):
             )
         except TimeoutError:
             logger.error(f"Таймаут анализа статьи {url}")
-            return url, ProcessingStatus.TIMEOUT, None, None, None
+            return {
+                "url": url,
+                "status": ProcessingStatus.TIMEOUT.value,
+                "score": None,
+                "words_count": None,
+                "time": None,
+            }
 
         elapsed_time = time.monotonic() - start_time
         logger.info(f"Анализ {url} завершён за {elapsed_time:.2f} сек.")
-        return url, ProcessingStatus.OK, rate, word_count, elapsed_time
-
+        return {
+            "url": url,
+            "status": ProcessingStatus.OK.value,
+            "score": round(rate, 2),
+            "words_count": word_count,
+            "time": round(elapsed_time, 2),
+        }
     except TimeoutError:
-        logger.error(f"Таймаут при скачивании {url}")
-        return url, ProcessingStatus.TIMEOUT, None, None, None
+        logger.error(f"Таймаут скачивания {url}")
+        return {"url": url, "status": ProcessingStatus.TIMEOUT.value, "score": None, "words_count": None, "time": None}
     except aiohttp.ClientError as e:
         logger.error(f"Ошибка HTTP при обработке {url}: {e}")
-        return url, ProcessingStatus.FETCH_ERROR, None, None, None
+        return {
+            "url": url,
+            "status": ProcessingStatus.FETCH_ERROR.value,
+            "score": None,
+            "words_count": None,
+            "time": None,
+        }
     except ArticleNotFound as e:
         logger.error(f"Статья не найдена на {url}: {e}")
-        return url, ProcessingStatus.PARSING_ERROR, None, None, None
+        return {
+            "url": url,
+            "status": ProcessingStatus.PARSING_ERROR.value,
+            "score": None,
+            "words_count": None,
+            "time": None,
+        }
     except Exception as e:
         logger.exception(f"Неожиданная ошибка при обработке {url}: {e}")
-        return url, ProcessingStatus.FETCH_ERROR, None, None, None
+        return {
+            "url": url,
+            "status": ProcessingStatus.FETCH_ERROR.value,
+            "score": None,
+            "words_count": None,
+            "time": None,
+        }
 
 
-async def set_result(idx, url, session, charged_words, morph, results):
-    res = await process_article(session, url, charged_words, morph)
-    results[idx] = res
+async def handle(request, charged_words, morph):
+    urls_param = request.query.get("urls", "")
+    if not urls_param:
+        urls_list = []
+    else:
+        urls_list = [url.strip() for url in urls_param.split(",")]
+
+    if len(urls_list) > MAX_URLS:
+        return web.json_response({"error": f"too many urls in request, should be {MAX_URLS} or less"}, status=400)
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [process_article(session, url, charged_words, morph) for url in urls_list]
+        results = await anyio.create_task_group(*tasks)
+
+    return web.json_response(results)
 
 
-async def main():
+def main():
     charged_words = load_charged_words()
     morph = pymorphy2.MorphAnalyzer()
 
-    async with aiohttp.ClientSession() as session:
-        results = [None] * len(TEST_ARTICLES)
-        async with create_task_group() as tg:
-            for idx, url in enumerate(TEST_ARTICLES):
-                tg.start_soon(set_result, idx, url, session, charged_words, morph, results)
+    app = web.Application()
+    handler = partial(handle, charged_words=charged_words, morph=morph)
+    app.router.add_get("/", handler)
 
-        print("\nРезультаты анализа:\n")
-        for item in results:
-            if item is None:
-                continue
-            url, status, rate, word_count, elapsed_time = item
-            print(f"URL: {url}")
-            print(f"Статус: {status.value}")
-            if status == ProcessingStatus.OK:
-                print(f"Рейтинг: {rate:.2f}")
-                print(f"Слов в статье: {word_count}")
-                print(f"Время анализа: {elapsed_time:.2f} сек.")
-            else:
-                print("Рейтинг: None")
-                print("Слов в статье: None")
-            print("-" * 50)
+    logger.info("Сервер запущен на http://127.0.0.1:8080")
+    web.run_app(app, host="127.0.0.1", port=8080)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nВыход")
+    main()
